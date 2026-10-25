@@ -1,0 +1,28 @@
+# region imports
+from AlgorithmImports import *
+# endregion
+
+
+class RsiFixedSharesAlgorithm(QCAlgorithm):
+
+    _trade_quantity = 100
+
+    def initialize(self) -> None:
+        self.set_start_date(2023, 1, 1)
+        self.set_cash(100000)
+        self.settings.automatic_indicator_warm_up = True
+
+        self._equity = self.add_equity("SPY", Resolution.DAILY)
+        self._rsi = self.rsi(self._equity.symbol, 14, MovingAverageType.WILDERS, Resolution.DAILY)
+        self.plot_indicator("RSI", self._rsi)
+
+    def on_data(self, data: Slice) -> None:
+        if not self._rsi.is_ready:
+            return
+
+        rsi = self._rsi.current.value
+        quantity = self._equity.holdings.quantity
+
+        # Buy 100 shares when RSI falls below 40.
+        if rsi < 40 and quantity < self._trade_quantity:
+            self.market_order(self._equity.symbol, self._trade_quantity, tag="RSI below 40: buy 100 shares")
