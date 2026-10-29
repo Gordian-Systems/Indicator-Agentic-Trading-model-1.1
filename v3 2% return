@@ -1,0 +1,253 @@
+# region imports
+from AlgorithmImports import *
+# endregion
+
+
+class ZeroFeeModel(FeeModel):
+    """Fee model that returns zero for every order."""
+
+    def get_order_fee(self, parameters: OrderFeeParameters) -> OrderFee:
+        return OrderFee(CashAmount(0, "USD"))
+
+
+class UnderlyingSignals:
+    """Bundle of the daily indicators for one underlying."""
+
+    def __init__(
+        self,
+        equity: Equity,
+        rsi: RelativeStrengthIndex,
+        sma: SimpleMovingAverage,
+        macd: MovingAverageConvergenceDivergence,
+    ) -> None:
+        self.equity = equity
+        self.rsi = rsi
+        self.sma = sma
+        self.macd = macd
+
+    @property
+    def is_ready(self) -> bool:
+        return bool(self.rsi.is_ready and self.sma.is_ready and self.macd.is_ready)
+
+    @property
+    def buy_signal(self) -> bool:
+        return bool(
+            self.rsi.current.value < 35
+            and self.sma.current.value > self.equity.price
+            and self.macd.current.value < -0.3
+        )
+
+
+class UnderlyingState:
+    """Position state for one underlying: the option contract we intend to hold
+    and the in-flight order ticket, so pending MarketOnOpen fills can never
+    produce double entries or orphaned (untracked) positions."""
+
+    def __init__(self, signals: UnderlyingSignals) -> None:
+        self.signals = signals
+        self.position_symbol: Symbol | None = None
+        self.pending_order_id: int | None = None
+
+    @property
+    def is_idle(self) -> bool:
+        return self.position_symbol is None and self.pending_order_id is None
+
+
+class OversoldCallBuyingAlgorithm(QCAlgorithm):
+    """Buys call options per qualifying underlying when the underlying is oversold
+    (RSI < 35, price below its 50-day SMA, MACD(12,26,9) < -0.3), and exits when
+    the underlying RSI rises above 60, the option is up 20% from its average
+    entry price, or 7 days remain to expiration.
+
+    Contract filters: CALL only, delta > 0.25, theta < 0.15, strike within $20 of
+    the underlying spot, and 25 to 90 calendar days to expiration.
+    Entry size: 100 contracts (capped by available margin).
+    Underlyings: NVDA, AMZN, and SPY (the liquid S&P 500 ETF proxy requested as XSP).
+    """
+
+    _ENTRY_CONTRACTS = 10
+    _TAKE_PROFIT_PCT = 0.20
+    _MAX_STRIKE_DISTANCE = 20.0
+    _MIN_DELTA = 0.25
+    _MAX_THETA = 0.15
+    _EXIT_DAYS_TO_EXPIRY = 7
+    _RSI_EXIT_LEVEL = 60.0
+
+    def initialize(self) -> None:
+        self.set_start_date(2025, 1, 1)
+        self.set_cash(100_000)
+        # Zero fees on every security (underlyings and option contracts).
+        self.set_security_initializer(lambda security: security.set_fee_model(ZeroFeeModel()))
+        self.settings.seed_initial_prices = True
+
+        self._states: list[UnderlyingState] = []
+        self._state_by_underlying: dict[Symbol, UnderlyingState] = {}
+        self._option_chains: dict[Symbol, Option] = {}
+
+        for ticker in ["NVDA", "AMZN", "SPY"]:
+            equity = self.add_equity(
+                ticker, Resolution.DAILY, data_normalization_mode=DataNormalizationMode.RAW
+            )
+            option = self.add_option(equity.symbol, Resolution.DAILY)
+            option.set_filter(
+                lambda u: u.include_weeklys()
+                .calls_only()
+                .strikes(-30, 30)
+                .expiration(25, 90)
+            )
+            self._option_chains[equity.symbol] = option
+
+            state = UnderlyingState(
+                UnderlyingSignals(
+                    equity,
+                    self.rsi(equity, 14, MovingAverageType.WILDERS, Resolution.DAILY),
+                    self.sma(equity, 50, Resolution.DAILY),
+                    self.macd(
+                        equity, 12, 26, 9, MovingAverageType.EXPONENTIAL, Resolution.DAILY
+                    ),
+                )
+            )
+            self._states.append(state)
+            self._state_by_underlying[equity.symbol] = state
+
+        self.set_warm_up(timedelta(120), Resolution.DAILY)
+
+    def on_data(self, data: Slice) -> None:
+        if self.is_warming_up:
+            return
+
+        for state in self._states:
+            equity = state.signals.equity
+
+            # Long call-only strategy: shares delivered by an ITM exercise are
+            # never a signal, so flatten them. Skip option logic while shares
+            # are being delivered/cleared.
+            if equity.holdings.quantity != 0:
+                self.liquidate(equity.symbol, tag="Exercise cleanup")
+                continue
+
+            # Wait for the in-flight order to settle before any decision.
+            if state.pending_order_id is not None:
+                continue
+
+            if state.position_symbol is not None:
+                option_symbol = state.position_symbol
+                holding = self.portfolio[option_symbol]
+                if not holding.invested:
+                    # Take-profit filled, expired worthless, or otherwise closed.
+                    state.position_symbol = None
+                else:
+                    price = self.securities[option_symbol].price
+                    dte = (option_symbol.id.date.date() - self.time.date()).days
+                    tag = None
+                    if (
+                        state.signals.rsi.current.value is not None
+                        and state.signals.rsi.current.value > self._RSI_EXIT_LEVEL
+                    ):
+                        tag = f"RSI > {self._RSI_EXIT_LEVEL:.0f} exit"
+                    elif (
+                        holding.average_price > 0
+                        and price >= holding.average_price * (1 + self._TAKE_PROFIT_PCT)
+                    ):
+                        tag = f"Take profit +{self._TAKE_PROFIT_PCT:.0%}"
+                    elif dte <= self._EXIT_DAYS_TO_EXPIRY:
+                        # Exercising an ITM long call delivers shares worth
+                        # roughly strike x 100, which can exceed buying power;
+                        # selling before expiry realizes the same intrinsic value.
+                        tag = f"Pre-expiry exit {dte} DTE"
+                    if tag is not None:
+                        tickets = self.liquidate(option_symbol, tag=tag)
+                        if tickets:
+                            state.pending_order_id = tickets[0].order_id
+                    continue
+
+            # Entry check.
+            signals = state.signals
+            if not signals.is_ready or not signals.buy_signal:
+                continue
+
+            contract = self._select_call(equity.symbol, data)
+            if contract is None:
+                continue
+
+            multiplier = self.securities[contract.symbol].symbol_properties.contract_multiplier
+            # Fixed entry size: 100 contracts.
+            quantity = self._ENTRY_CONTRACTS
+            # Long options require the full premium as initial margin; cap the
+            # quantity at what the current margin can cover.
+            affordable = int(self.portfolio.margin_remaining / (contract.price * multiplier))
+            quantity = min(quantity, affordable)
+            if quantity < 1:
+                continue
+
+            ticket = self.market_order(
+                contract.symbol,
+                quantity,
+                tag=f"Oversold call entry {equity.symbol}",
+            )
+            state.position_symbol = contract.symbol
+            if ticket is not None and ticket.status != OrderStatus.INVALID:
+                state.pending_order_id = ticket.order_id
+
+    def on_order_event(self, order_event: OrderEvent) -> None:
+        if order_event.status not in (
+            OrderStatus.FILLED,
+            OrderStatus.CANCELED,
+            OrderStatus.INVALID,
+        ):
+            return
+
+        # Backstop: sell shares delivered by an option exercise immediately.
+        if (
+            order_event.symbol in self._state_by_underlying
+            and order_event.status == OrderStatus.FILLED
+            and self.portfolio[order_event.symbol].quantity != 0
+            and (
+                order_event.is_assignment
+                or "exercise" in order_event.message.lower()
+            )
+        ):
+            self.liquidate(order_event.symbol, tag="Exercise cleanup")
+            return
+
+        # Clear the pending-order gate once the order reaches a final state.
+        state = self._state_for_order_symbol(order_event.symbol)
+        if state is None or state.pending_order_id != order_event.order_id:
+            return
+        state.pending_order_id = None
+        if order_event.status == OrderStatus.INVALID and state.position_symbol == order_event.symbol:
+            # Entry rejected; free the slot for a retry.
+            state.position_symbol = None
+
+    def _state_for_order_symbol(self, symbol: Symbol) -> UnderlyingState | None:
+        if symbol in self._state_by_underlying:
+            return None
+        if symbol.has_underlying:
+            return self._state_by_underlying.get(symbol.underlying)
+        return None
+
+    def _select_call(self, underlying_symbol: Symbol, data: Slice) -> OptionContract | None:
+        chain = data.option_chains.get(self._option_chains[underlying_symbol])
+        if chain is None:
+            return None
+
+        spot = self.securities[underlying_symbol].price
+        if spot == 0:
+            return None
+
+        candidates = [
+            c
+            for c in chain
+            if c.right == OptionRight.CALL
+            and abs(c.strike - spot) <= self._MAX_STRIKE_DISTANCE
+            and c.greeks.delta is not None
+            and c.greeks.delta > self._MIN_DELTA
+            and c.greeks.theta is not None
+            and c.greeks.theta < self._MAX_THETA
+            and c.bid_price > 0
+            and c.price > 0
+        ]
+        if not candidates:
+            return None
+
+        return min(candidates, key=lambda c: abs(c.strike - spot))
